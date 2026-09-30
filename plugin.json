@@ -1,0 +1,6 @@
+{
+  "emby": {
+    "url": "https://raw.githubusercontent.com/pgxrpbwvb76/telebox/refs/heads/main/emby.ts",
+    "desc": "Emby 管理"
+  }
+}
