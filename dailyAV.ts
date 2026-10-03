@@ -21,6 +21,8 @@ import { JSONFilePreset } from "lowdb/node";
 import axios, { AxiosInstance } from "axios";
 import * as https from "https";
 import * as path from "path";
+import * as fs from "fs/promises";
+import * as os from "os";
 
 // ────────────────────────────────────────────────────────────
 // 常量与工具
@@ -70,6 +72,21 @@ function htmlEscapeSafe(t: unknown): string {
 function truncate(text: string, max: number): string {
   if (!text) return "";
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+/** 清理刮削简介中的 HTML、脚本残留、空白和已知营销尾文；不执行任何代码。 */
+function cleanOverview(input: unknown): string {
+  let text = String(input ?? "");
+  text = text.replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, "");
+  text = text.replace(/^.*\b(?:window|document)\s*(?:\[|\.).*$/gm, "");
+  text = text.replace(/<(?:br\s*\/?|\/p|\/div)>/gi, "\n").replace(/<[^>]+>/g, "");
+  text = text.replace(/&nbsp;|&#160;/gi, " ").replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<").replace(/&gt;/gi, ">").replace(/&quot;/gi, '"');
+  // 仅截掉明确的订阅广告尾段，不按普通剧情词汇删内容。
+  const promo = text.search(/当アカウントをフォロー|メルマガをお受け取り|こちらよりフォロー/);
+  if (promo >= 0) text = text.slice(0, promo);
+  return text.replace(/\r/g, "").replace(/[ \t]+/g, " ")
+    .replace(/\n[ \t]+/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 function todayStr(): string {
@@ -194,7 +211,7 @@ class AvEmbyApi {
       const res = await this.req<any>("GET", "/Items", undefined, {
         ParentId: parentId,
         Recursive: true,
-        IncludeItemTypes: "Movie,Series,Episode",
+        IncludeItemTypes: "Movie,Episode,Video",
         Fields: "Genres,ProductionYear,Overview,Path",
         SortBy: "Random",
         SortOrder: "Ascending",
@@ -212,9 +229,8 @@ class AvEmbyApi {
 
   /** 查播放直链（取 MediaSources[0].Path） */
   async playbackInfo(itemId: string): Promise<any> {
-    return this.req<any>("POST", `/Items/${itemId}/PlaybackInfo`, {
-      DeviceProfile: { DirectPlayProfiles: [{ Type: "Video" }] },
-    });
+    // 只查询媒体源，不请求协商播放/转码，避免不完整 DeviceProfile 引发服务端异常。
+    return this.req<any>("POST", `/Items/${encodeURIComponent(itemId)}/PlaybackInfo`, {});
   }
 
   /** 海报图片 URL */
@@ -538,7 +554,7 @@ class DailyAVPlugin extends Plugin {
 
   private itemMeta(item: any): { title: string; year: string; genres: string; overview: string } {
     const year = item.ProductionYear ? String(item.ProductionYear) : "";
-    const genres = Array.isArray(item.Genres) ? item.Genres.join(" / ") : "";
+    const genres = Array.isArray(item.Genres) ? truncate(item.Genres.slice(0, 6).join(" / "), 90) : "";
     let title = item.Name || "未知";
     // 剧集：带 SxxExx
     if (item.Type === "Episode" && item.SeriesName) {
@@ -546,7 +562,8 @@ class DailyAVPlugin extends Plugin {
       const e = item.IndexNumber != null ? `E${String(item.IndexNumber).padStart(2, "0")}` : "";
       title = `${item.SeriesName} ${s}${e} — ${item.Name}`;
     }
-    const overview = item.Overview ? truncate(item.Overview, 500) : "";
+    title = truncate(String(title), 120);
+    const overview = truncate(cleanOverview(item.Overview), 350);
     return { title, year, genres, overview };
   }
 
@@ -555,20 +572,16 @@ class DailyAVPlugin extends Plugin {
     const { title, year, genres, overview } = this.itemMeta(item);
     const itemId = String(item.Id);
 
-    // 取直链
-    let directUrl = "";
-    let urlError = "";
+    // 只取当前服务器 PlaybackInfo 返回的 Path，不使用 DirectStreamUrl、不拼接路径。
+    let info: any;
     try {
-      const info = await api.playbackInfo(itemId);
-      const src = info?.MediaSources?.[0];
-      directUrl = src?.Path || "";
-      if (!directUrl) directUrl = src?.DirectStreamUrl || "";
-      // Path 可能是相对路径，若不是 http 开头则拼 base
-      if (directUrl && !/^https?:\/\//i.test(directUrl)) {
-        directUrl = `${api.origin}${directUrl.startsWith("/") ? "" : "/"}${directUrl}`;
-      }
+      info = await api.playbackInfo(itemId);
     } catch (error) {
-      urlError = describeError(error);
+      throw new Error(`条目 ${itemId} (${item.Type || "未知类型"}) PlaybackInfo 失败: ${describeError(error)}`);
+    }
+    const directUrl = info?.MediaSources?.[0]?.Path;
+    if (typeof directUrl !== "string" || !/^https?:\/\//i.test(directUrl)) {
+      throw new Error(`条目 ${itemId} 没有可用的 HTTP(S) Path，已取消推送（不回退）`);
     }
 
     const typeLabel = item.Type || "";
@@ -580,15 +593,7 @@ class DailyAVPlugin extends Plugin {
       lines.push(``);
       lines.push(`📝 ${htmlEscapeSafe(overview)}`);
     }
-    if (directUrl) {
-      lines.push(``);
-      lines.push(`🔗 <a href="${htmlEscapeSafe(directUrl)}">播放</a>`);
-      lines.push(``);
-      lines.push(`<code>${htmlEscapeSafe(truncate(directUrl, 80))}</code>`);
-    } else if (urlError) {
-      lines.push(``);
-      lines.push(`⚠️ 直链获取失败: ${htmlEscapeSafe(urlError)}`);
-    }
+    lines.push(``, `🔗 <a href="${htmlEscapeSafe(directUrl)}">播放直链</a>`);
     if (typeLabel) lines.push(``, `📦 类型: ${htmlEscapeSafe(typeLabel)}`);
 
     return { text: lines.join("\n"), imageUrl: api.imageUrl(itemId) };
@@ -600,16 +605,36 @@ class DailyAVPlugin extends Plugin {
     if (!client) throw new Error("获取 Telegram 客户端失败");
     const { text, imageUrl } = await this.buildPush(api, item);
 
-    // 带图片：先发图片（caption=文本），图片加载失败则退回纯文本
+    // Emby 图片 URL 无扩展名，teleproto 会误判成 document。
+    // 下载并校验图片魔数，再以 .jpg/.png 临时文件上传成照片。
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "dailyav-poster-"));
     try {
+      const cfg = await this.cfg();
+      const response = await axios.create().request<any>({
+        method: "GET", url: imageUrl, responseType: "arraybuffer",
+        timeout: HTTP_TIMEOUT_MS, maxRedirects: 0,
+        headers: { "X-Emby-Token": cfg.apiKey },
+        maxContentLength: 10 * 1024 * 1024,
+        validateStatus: (status: number) => status === 200,
+      });
+      const data = Buffer.from(response.data);
+      const jpeg = data.length >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff;
+      const png = data.length >= 8 && data.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10]));
+      if (!jpeg && !png) throw new Error("海报接口未返回 JPEG/PNG 图片");
+      const poster = path.join(tempDir, jpeg ? "poster.jpg" : "poster.png");
+      await fs.writeFile(poster, data);
       await client.sendFile(chatId, {
-        file: imageUrl,
+        file: poster,
+        forceDocument: false,
         caption: text,
         parseMode: "html",
       } as any);
       return;
     } catch (error) {
-      console.error(`[${PLUGIN_NAME}] 发图失败，回退纯文本:`, error);
+      // 不打印 Axios 错误对象，避免其请求头泄露 API Key。
+      console.error(`[${PLUGIN_NAME}] 海报发送失败，回退纯文本: ${describeError(error)}`);
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
     }
     for (const chunk of splitMessage(text)) {
       await client.sendMessage(chatId, { message: chunk, parseMode: "html" } as any);
