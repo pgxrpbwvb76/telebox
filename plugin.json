@@ -3,9 +3,8 @@
     "url": "https://raw.githubusercontent.com/pgxrpbwvb76/telebox/refs/heads/main/emby6.ts",
     "desc": "Emby 管理"
   },
-  "dailyAV": 
-  {
-    "url":"https://raw.githubusercontent.com/pgxrpbwvb76/telebox/refs/heads/main/dailyAV.ts",
-    "desc":"每天从emby获取AV资源，并推送到telegram"
-},
+  "dailyAV": {
+    "url": "https://raw.githubusercontent.com/pgxrpbwvb76/telebox/refs/heads/main/dailyAV.ts",
+    "desc": "每天从 Emby 获取 AV 资源，并推送到 Telegram"
+  }
 }
